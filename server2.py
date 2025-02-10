@@ -190,37 +190,40 @@ class ChatServer:
         resp_str = json.dumps(resp) + "\n"
         client_state.queue_message(resp_str)
 
-    # Create
-    # Accounts exists
+    # Check if username exists
+    def check_username(self, request):
+        """Endpoint to check if a username exists."""
+        username = request.get("username", "")
+        if not username:
+            self.send_response(None, success=False, message="Username not provided.")
+            return
+        
+        if username in accounts:
+            self.send_response(None, success=True, message="Username exists.")
+        else:
+            self.send_response(None, success=False, message="Username does not exist.")
 
-    def handle_create(self, client_state, request):
+    # Create account
+    def create_account(self, client_state, request):
+        """Endpoint to create a new account and log the user in."""
         username = request.get("username", "")
         password_hash = request.get("password_hash", "")
-
+        
         if not username or not password_hash:
             self.send_response(client_state, success=False, message="Username or password not provided.")
             return
-
+        
         if username in accounts:
-            if accounts[username]["password_hash"] == password_hash:
-                # Log in
-                client_state.current_user = username
-                unread = get_unread_count(username)
-                msg = (f"User '{username}' already exists. "
-                       f"Logged in successfully. Unread messages: {unread}.")
-                self.send_response(client_state, success=True, message=msg)
-            else:
-                self.send_response(client_state, success=False,
-                                   message="User exists but password is incorrect.")
-        else:
-            # Create new account
-            accounts[username] = {
-                "password_hash": password_hash,
-                "messages": []
-            }
-            client_state.current_user = username
-            msg = f"New account '{username}' created and logged in."
-            self.send_response(client_state, success=True, message=msg)
+            self.send_response(client_state, success=False, message="Username already exists.")
+            return
+        
+        accounts[username] = {
+            "password_hash": password_hash,
+            "messages": []
+        }
+        client_state.current_user = username
+        msg = f"New account '{username}' created and logged in."
+        self.send_response(client_state, success=True, message=msg)
 
     # Login
     def handle_login(self, client_state, request):
@@ -297,23 +300,36 @@ class ChatServer:
         msg = f"Message sent to '{recipient}': {content}"
         self.send_response(client_state, success=True, message=msg)
 
-    # Read message/ with indexing
+    # Read message with indexing
     def handle_read(self, client_state, request):
         if client_state.current_user is None:
             self.send_response(client_state, success=False, message="Please log in first.")
             return
 
-        count = request.get("count", 5)
+        page_size = request.get("page_size", 5)
+        page_num = request.get("page_num", 1)
+
         user_msgs = accounts[client_state.current_user]["messages"]
         unread_msgs = [m for m in user_msgs if not m["read"]]
 
-        to_read = unread_msgs[:count]
+        total_unread = len(unread_msgs)
+        
+        start_index = (page_num - 1) * page_size
+        end_index = start_index + page_size
+
+        if start_index >= total_unread:
+            to_read = []
+        else:
+            to_read = unread_msgs[start_index:end_index]
+
+        # Mark these messages as read
         for m in to_read:
             m["read"] = True
 
         response_data = {
             "read_messages": to_read,
-            "remaining_unread": len(unread_msgs) - len(to_read)
+            "total_unread": total_unread,
+            "remaining_unread": total_unread - len(to_read)
         }
         self.send_response(client_state, success=True, data=response_data)
 
@@ -368,10 +384,6 @@ class ChatServer:
         print(f"[SERVER] Disconnecting {client_state.addr}")
         self.selector.unregister(client_state.sock)
         client_state.close()
-
-########################################
-# Entry point
-########################################
 
 if __name__ == "__main__":
     server = ChatServer(HOST, PORT)
