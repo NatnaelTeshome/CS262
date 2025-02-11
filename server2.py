@@ -3,32 +3,41 @@ import socket
 import json
 import hashlib
 
-
 with open("config.json", "r") as file:
     config = json.load(file)
 
 HOST = config["HOST"]
 PORT = config["PORT"]
 
-# In-memory database
-accounts = {}
-# Example structure:
-#   accounts = {
-#       "alice": {
-#           "password_hash": "...",
-#           "messages": [
-#               {"id": 1, "sender": "bob", "content": "Hello", "read": False},
+# === CHANGED: Account structure now includes both 'messages' and 'conversations' ===
+# accounts = {
+#   "alice": {
+#       "password_hash": "...",
+#       "messages": [  # all incoming messages for 'alice'
+#           {"id": 1, "sender": "bob", "content": "Hello", "read": False},
+#           {"id": 2, "sender": "charlie", "content": "Hi there", "read": True},
+#           ...
+#       ],
+#       "conversations": {  # same messages, but grouped by 'sender'
+#           "bob": [
+#               {"id": 1, "content": "Hello", "read": False}
 #               ...
-#           ]
-#       },
-#       ...
-#   }
+#           ],
+#           "charlie": [...],
+#           ...
+#       }
+#   },
+#   ...
+# }
+accounts = {}
 
-# Increments for every new message
 global_message_id = 0  
 
 def get_unread_count(username):
-    """Return number of unread messages for a user."""
+    """
+    Return number of unread messages for a user by scanning the 'messages' list.
+    (i.e., total across all senders)
+    """
     user_info = accounts.get(username, {})
     msgs = user_info.get("messages", [])
     return sum(1 for m in msgs if not m["read"])
@@ -41,22 +50,25 @@ class ClientState:
     def __init__(self, sock):
         self.sock = sock
         self.addr = sock.getpeername()
-        self.in_buffer = ""     # buffer for incoming data
-        self.out_buffer = []    # list of strings to send out
+        self.in_buffer = ""
+        self.out_buffer = []
         self.current_user = None
 
     def queue_message(self, message_str):
-        """Queue a message (string) to be written to the client."""
+        """
+        Add a string (JSON-serialized response + newline) to the output buffer.
+        """
         self.out_buffer.append(message_str)
 
     def close(self):
-        """Close this client's connection."""
+        """
+        Close this client's connection.
+        """
         try:
             self.sock.close()
         except OSError:
             pass
 
-# The main chat server
 class ChatServer:
     def __init__(self, host, port):
         self.host = host
@@ -72,16 +84,14 @@ class ChatServer:
         listen_sock.setblocking(False)
 
         self.selector.register(listen_sock, selectors.EVENT_READ, data=None)
-
         print(f"[SERVER] Listening on {self.host}:{self.port} (selectors-based)")
+
         try:
             while True:
-                events = self.selector.select(timeout=None)  # Blocking call; returns list of (key, mask)
+                events = self.selector.select(timeout=None)
                 for key, mask in events:
-                    # Check if the event is from the listening socket
                     if key.data is None:
                         self.accept_connection(key.fileobj)
-                    # The event is from clients
                     else:
                         self.service_connection(key, mask)
         except KeyboardInterrupt:
@@ -95,28 +105,27 @@ class ChatServer:
         print(f"[SERVER] Accepted connection from {addr}")
         conn.setblocking(False)
         client_state = ClientState(conn)
-        # Register this client socket for both read and write events and client state as data (will be used for id)
         self.selector.register(conn, selectors.EVENT_READ | selectors.EVENT_WRITE, data=client_state)
 
     def service_connection(self, key, mask):
-        """Handle read/write events for a connected client."""
         sock = key.fileobj
         client_state = key.data
 
-        # Ready for read
         if mask & selectors.EVENT_READ:
             self.read_from_client(client_state)
-
-        # Ready for write 
         if mask & selectors.EVENT_WRITE:
             self.write_to_client(client_state)
 
     def read_from_client(self, client_state):
-        """Non-blocking read from the client socket; handle partial lines and parse JSON commands."""
-        data = client_state.sock.recv(1024)
+        """Read any incoming data, parse it by lines, handle JSON commands."""
+        try:
+            data = client_state.sock.recv(1024)
+        except ConnectionResetError:
+            data = None
+
         if data:
             client_state.in_buffer += data.decode('utf-8')
-            # Separate the commands: in the client side, each JSON request is separated by a new line
+            # Process line by line
             while True:
                 if "\n" in client_state.in_buffer:
                     line, remainder = client_state.in_buffer.split("\n", 1)
@@ -130,25 +139,23 @@ class ChatServer:
             self.disconnect_client(client_state)
 
     def write_to_client(self, client_state):
-        """Write any queued responses to the client socket."""
+        """Send out any queued messages from out_buffer."""
         while client_state.out_buffer:
-            # Send the first queued message
-            message_str = client_state.out_buffer.pop(0)
+            msg_str = client_state.out_buffer.pop(0)
             try:
-                client_state.sock.sendall(message_str.encode('utf-8'))
+                client_state.sock.sendall(msg_str.encode('utf-8'))
             except Exception:
                 self.disconnect_client(client_state)
                 break
 
     def process_command(self, client_state, line):
         """
-        Parse the command (expected to be JSON), handle it, and queue a response.
-        For example: {"action": "CREATE", "username": "alice", "password_hash": "..."}
+        Decode JSON, then dispatch to the proper handler based on "action".
         """
         try:
             request = json.loads(line)
         except json.JSONDecodeError:
-            self.send_response(client_state, success=False, message="Invalid request (not valid JSON).")
+            self.send_response(client_state, success=False, message="Invalid JSON.")
             return
 
         action = request.get("action", "").upper()
@@ -162,6 +169,7 @@ class ChatServer:
         elif action == "SEND":
             self.handle_send(client_state, request)
         elif action == "READ":
+            # We'll show both reading all unread or reading from a specific partner
             self.handle_read(client_state, request)
         elif action == "DELETE_MESSAGE":
             self.handle_delete_message(client_state, request)
@@ -169,217 +177,296 @@ class ChatServer:
             self.handle_delete_account(client_state)
         elif action == "LOGOUT":
             self.handle_logout(client_state)
-        # Change this when integrating with the GUI
         elif action == "QUIT":
             self.send_response(client_state, success=True, message="Connection closed.")
             self.disconnect_client(client_state)
         else:
-            self.send_response(client_state, success=False, message=f"Unknown action: {action}")
+            self.send_response(client_state, success=False,
+                               message=f"Unknown action: {action}")
 
     def send_response(self, client_state, success=True, message="", data=None):
         """
-        Queue a JSON response to the client's out_buffer.
-        We'll append a '\n' so the client can read line by line.
+        Enqueue a JSON response message for the client to read.
         """
-        resp = {
-            "success": success,
-            "message": message
-        }
+        resp = {"success": success, "message": message}
         if data is not None:
             resp["data"] = data
         resp_str = json.dumps(resp) + "\n"
         client_state.queue_message(resp_str)
 
-    # Check if username exists
-    def check_username(self, request):
-        """Endpoint to check if a username exists."""
-        username = request.get("username", "")
-        if not username:
-            self.send_response(None, success=False, message="Username not provided.")
-            return
-        
-        if username in accounts:
-            self.send_response(None, success=True, message="Username exists.")
-        else:
-            self.send_response(None, success=False, message="Username does not exist.")
-
-    # Create account
-    def create_account(self, client_state, request):
-        """Endpoint to create a new account and log the user in."""
+    # === CHANGED: CREATE a user with both 'messages' and 'conversations' keys ===
+    def handle_create(self, client_state, request):
         username = request.get("username", "")
         password_hash = request.get("password_hash", "")
-        
+
         if not username or not password_hash:
-            self.send_response(client_state, success=False, message="Username or password not provided.")
+            self.send_response(client_state, success=False, 
+                               message="Username or password hash missing.")
             return
-        
+
         if username in accounts:
-            self.send_response(client_state, success=False, message="Username already exists.")
+            self.send_response(client_state, success=False, 
+                               message="Username already exists.")
             return
-        
+
         accounts[username] = {
             "password_hash": password_hash,
-            "messages": []
+            "messages": [],  # list of all incoming messages
+            "conversations": {}  # dict of partner -> list of messages
         }
-        client_state.current_user = username
-        msg = f"New account '{username}' created and logged in."
-        self.send_response(client_state, success=True, message=msg)
 
-    # Login
+        client_state.current_user = username
+        self.send_response(client_state, success=True,
+                           message=f"Account '{username}' created & logged in.")
+
     def handle_login(self, client_state, request):
         username = request.get("username", "")
         password_hash = request.get("password_hash", "")
 
         if not username or not password_hash:
-            self.send_response(client_state, success=False, message="Username or password not provided.")
+            self.send_response(client_state, success=False,
+                               message="Username or password hash missing.")
             return
 
         if username not in accounts:
-            self.send_response(client_state, success=False, message="No such user.")
-        else:
-            if accounts[username]["password_hash"] == password_hash:
-                client_state.current_user = username
-                unread = get_unread_count(username)
-                msg = f"Logged in as '{username}'. Unread messages: {unread}."
-                self.send_response(client_state, success=True, message=msg)
-            else:
-                self.send_response(client_state, success=False, message="Incorrect password.")
+            self.send_response(client_state, success=False,
+                               message="No such user.")
+            return
 
-    # List accounts
+        # Check password
+        if accounts[username]["password_hash"] != password_hash:
+            self.send_response(client_state, success=False,
+                               message="Incorrect password.")
+            return
+
+        client_state.current_user = username
+        unread_count = get_unread_count(username)
+        self.send_response(client_state, success=True,
+                           message=f"Logged in as '{username}'. Unread messages: {unread_count}.")
+
     def handle_list_accounts(self, client_state, request):
         if client_state.current_user is None:
-            self.send_response(client_state, success=False, message="Please log in first.")
+            self.send_response(client_state, success=False, 
+                               message="Please log in first.")
             return
 
         page_size = request.get("page_size", 10)
-        page_num = request.get("page_num", 1)
+        page_num  = request.get("page_num", 1)
 
         all_accounts = sorted(accounts.keys())
         total_accounts = len(all_accounts)
 
         start_index = (page_num - 1) * page_size
-        end_index = start_index + page_size
+        end_index   = start_index + page_size
 
         if start_index >= total_accounts:
             page_accounts = []
         else:
             page_accounts = all_accounts[start_index:end_index]
 
-        response_data = {
+        data = {
             "total_accounts": total_accounts,
             "accounts": page_accounts
         }
-        self.send_response(client_state, success=True, data=response_data)
+        self.send_response(client_state, success=True, data=data)
 
-    # Send message
+    # === CHANGED: 'handle_send' also updates both the recipient’s 'messages' and 'conversations' ===
     def handle_send(self, client_state, request):
         if client_state.current_user is None:
-            self.send_response(client_state, success=False, message="Please log in first.")
+            self.send_response(client_state, success=False, 
+                               message="Please log in first.")
             return
 
+        sender = client_state.current_user
         recipient = request.get("recipient", "")
         content = request.get("content", "").strip()
+
         if not recipient or not content:
-            self.send_response(client_state, success=False, message="Recipient or content not provided.")
+            self.send_response(client_state, success=False, 
+                               message="Recipient or content missing.")
             return
 
         if recipient not in accounts:
-            self.send_response(client_state, success=False, message="Recipient does not exist.")
+            self.send_response(client_state, success=False,
+                               message="Recipient does not exist.")
             return
 
         global global_message_id
         global_message_id += 1
+        msg_id = global_message_id
+
+        # 1) Add to the recipient's "messages" list
         new_msg = {
-            "id": global_message_id,
-            "sender": client_state.current_user,
+            "id": msg_id,
+            "sender": sender,
             "content": content,
             "read": False
         }
         accounts[recipient]["messages"].append(new_msg)
 
-        msg = f"Message sent to '{recipient}': {content}"
-        self.send_response(client_state, success=True, message=msg)
+        # 2) Also add to the 'conversations' dictionary
+        #    The key for the conversation is the sender's username
+        if sender not in accounts[recipient]["conversations"]:
+            accounts[recipient]["conversations"][sender] = []
+        # Within that conversation, store 'id', 'content', 'read'
+        accounts[recipient]["conversations"][sender].append({
+            "id": msg_id,
+            "content": content,
+            "read": False
+        })
 
-    # Read message with indexing
+        self.send_response(client_state, success=True, 
+                           message=f"Message sent to '{recipient}': {content}")
+
+    # === CHANGED: 'handle_read' can do two things, depending on 'chat_partner':
+    #      1) If chat_partner is provided, read from 'conversations[chat_partner]'
+    #      2) Else, read from the 'messages' list (unread only).
     def handle_read(self, client_state, request):
         if client_state.current_user is None:
-            self.send_response(client_state, success=False, message="Please log in first.")
+            self.send_response(client_state, success=False,
+                               message="Please log in first.")
             return
+
+        username = client_state.current_user
+        chat_partner = request.get("chat_partner", None)
 
         page_size = request.get("page_size", 5)
         page_num = request.get("page_num", 1)
 
-        user_msgs = accounts[client_state.current_user]["messages"]
-        unread_msgs = [m for m in user_msgs if not m["read"]]
+        # If the client wants to read from a specific conversation
+        if chat_partner:
+            conversations = accounts[username].get("conversations", {})
+            partner_msgs = conversations.get(chat_partner, [])
 
-        total_unread = len(unread_msgs)
-        
-        start_index = (page_num - 1) * page_size
-        end_index = start_index + page_size
+            total_msgs = len(partner_msgs)
+            start_idx = (page_num - 1) * page_size
+            end_idx = min(start_idx + page_size, total_msgs)
 
-        if start_index >= total_unread:
-            to_read = []
+            if start_idx >= total_msgs:
+                paginated = []
+            else:
+                paginated = partner_msgs[start_idx:end_idx]
+
+            # Mark them as read
+            for msg in paginated:
+                msg["read"] = True
+
+            # Also mark them as read in the 'messages' list
+            # so that they won't show up as unread later
+            all_msgs = accounts[username].get("messages", [])
+            # For each ID in paginated, mark it read in the main list
+            paginated_ids = {m["id"] for m in paginated}
+            for m in all_msgs:
+                if m["id"] in paginated_ids:
+                    m["read"] = True
+
+            self.send_response(
+                client_state,
+                success=True,
+                data={
+                    "conversation_with": chat_partner,
+                    "messages": paginated,
+                    "page_num": page_num,
+                    "page_size": page_size,
+                    "total_msgs": total_msgs,
+                    "remaining": max(0, total_msgs - end_idx)
+                }
+            )
+
         else:
-            to_read = unread_msgs[start_index:end_index]
+            # If no 'chat_partner' is provided, we read from the 'messages' list
+            # returning only UNREAD messages in paginated form
+            user_msgs = accounts[username]["messages"]
+            unread_msgs = [m for m in user_msgs if not m["read"]]
 
-        # Mark these messages as read
-        for m in to_read:
-            m["read"] = True
+            total_unread = len(unread_msgs)
+            start_index = (page_num - 1) * page_size
+            end_index = min(start_index + page_size, total_unread)
 
-        response_data = {
-            "read_messages": to_read,
-            "total_unread": total_unread,
-            "remaining_unread": total_unread - len(to_read)
-        }
-        self.send_response(client_state, success=True, data=response_data)
+            if start_index >= total_unread:
+                to_read = []
+            else:
+                to_read = unread_msgs[start_index:end_index]
 
-    # Delete message
+            # Mark them as read
+            for m in to_read:
+                m["read"] = True
+
+            # Also update them in the 'conversations' dictionary
+            # We can find which conversation they belong to by m["sender"]
+            conversations = accounts[username].get("conversations", {})
+            for msg in to_read:
+                sender = msg["sender"]
+                if sender in conversations:
+                    # Mark the corresponding message in that conversation as read
+                    for conv_msg in conversations[sender]:
+                        if conv_msg["id"] == msg["id"]:
+                            conv_msg["read"] = True
+
+            self.send_response(
+                client_state,
+                success=True,
+                data={
+                    "read_messages": to_read,
+                    "total_unread": total_unread,
+                    "remaining_unread": max(0, total_unread - end_index)
+                }
+            )
+
     def handle_delete_message(self, client_state, request):
         if client_state.current_user is None:
-            self.send_response(client_state, success=False, message="Please log in first.")
+            self.send_response(client_state, success=False,
+                               message="Please log in first.")
             return
 
-        # Helps take care if there are multiple messages or one
+        username = client_state.current_user
         message_ids = request.get("message_ids", [])
         if not isinstance(message_ids, list):
             message_ids = [message_ids]
 
-        user_msgs = accounts[client_state.current_user]["messages"]
+        user_msgs = accounts[username]["messages"]
         before_count = len(user_msgs)
-        user_msgs = [m for m in user_msgs if m["id"] not in message_ids]
-        after_count = len(user_msgs)
-        accounts[client_state.current_user]["messages"] = user_msgs
+
+        # Remove from 'messages'
+        new_msgs = [m for m in user_msgs if m["id"] not in message_ids]
+        after_count = len(new_msgs)
+        accounts[username]["messages"] = new_msgs
+
+        # Also remove from 'conversations'
+        conversations = accounts[username]["conversations"]
+        for partner, msg_list in conversations.items():
+            new_list = [m for m in msg_list if m["id"] not in message_ids]
+            conversations[partner] = new_list
 
         deleted_count = before_count - after_count
         msg = f"Deleted {deleted_count} messages."
         self.send_response(client_state, success=True, message=msg)
 
-    # Delete account
     def handle_delete_account(self, client_state):
         if client_state.current_user is None:
-            self.send_response(client_state, success=False, message="Please log in first.")
+            self.send_response(client_state, success=False,
+                               message="Please log in first.")
             return
 
         username = client_state.current_user
         del accounts[username]
-        self.send_response(client_state, success=True, message=f"Account '{username}' deleted.")
         client_state.current_user = None
+        self.send_response(client_state, success=True,
+                           message=f"Account '{username}' deleted.")
 
-    # Logout
     def handle_logout(self, client_state):
-        if client_state.current_user is not None:
+        if client_state.current_user is None:
+            self.send_response(client_state, success=False,
+                               message="No user is currently logged in.")
+        else:
             user = client_state.current_user
             client_state.current_user = None
             self.send_response(client_state, success=True,
                                message=f"User '{user}' logged out.")
-        else:
-            self.send_response(client_state, success=False,
-                               message="No user is currently logged in.")
 
     def disconnect_client(self, client_state):
         """
-        Unregister and close the client socket. 
-        This effectively ends the session with that client.
+        Unregister and close the client socket.
         """
         print(f"[SERVER] Disconnecting {client_state.addr}")
         self.selector.unregister(client_state.sock)
