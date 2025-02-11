@@ -160,8 +160,10 @@ class ChatServer:
 
         action = request.get("action", "").upper()
 
+        if action == "USERNAME":
+            self.check_username(request)
         if action == "CREATE":
-            self.handle_create(client_state, request)
+            self.create_account(client_state, request)
         elif action == "LOGIN":
             self.handle_login(client_state, request)
         elif action == "LIST_ACCOUNTS":
@@ -169,7 +171,7 @@ class ChatServer:
         elif action == "SEND":
             self.handle_send(client_state, request)
         elif action == "READ":
-            # We'll show both reading all unread or reading from a specific partner
+            # We'll show both reading all unread or reading from a specific user/friend/partner
             self.handle_read(client_state, request)
         elif action == "DELETE_MESSAGE":
             self.handle_delete_message(client_state, request)
@@ -194,31 +196,42 @@ class ChatServer:
         resp_str = json.dumps(resp) + "\n"
         client_state.queue_message(resp_str)
 
-    # === CHANGED: CREATE a user with both 'messages' and 'conversations' keys ===
-    def handle_create(self, client_state, request):
+    # Check if username exists
+    def check_username(self, request):
+        """Endpoint to check if a username exists."""
+        username = request.get("username", "")
+        if not username:
+            self.send_response(None, success=False, message="Username not provided.")
+            return
+        
+        if username in accounts:
+            self.send_response(None, success=True, message="Username exists.")
+        else:
+            self.send_response(None, success=False, message="Username does not exist.")
+
+    # Create account
+    def create_account(self, client_state, request):
+        """Endpoint to create a new account and log the user in."""
         username = request.get("username", "")
         password_hash = request.get("password_hash", "")
-
+        
         if not username or not password_hash:
-            self.send_response(client_state, success=False, 
-                               message="Username or password hash missing.")
+            self.send_response(client_state, success=False, message="Username or password not provided.")
             return
-
+        
         if username in accounts:
-            self.send_response(client_state, success=False, 
-                               message="Username already exists.")
+            self.send_response(client_state, success=False, message="Username already exists.")
             return
-
+        
         accounts[username] = {
             "password_hash": password_hash,
-            "messages": [],  # list of all incoming messages
-            "conversations": {}  # dict of partner -> list of messages
+            "messages": []
         }
-
         client_state.current_user = username
-        self.send_response(client_state, success=True,
-                           message=f"Account '{username}' created & logged in.")
+        msg = f"New account '{username}' created and logged in."
+        self.send_response(client_state, success=True, message=msg)
 
+    # login
     def handle_login(self, client_state, request):
         username = request.get("username", "")
         password_hash = request.get("password_hash", "")

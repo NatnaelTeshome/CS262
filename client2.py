@@ -55,24 +55,39 @@ def main():
 
             if user_input.lower() == "help":
                 print("""Available commands:
-1) CREATE <username> <password>
-2) LOGIN <username> <password>
-3) LIST ACCOUNTS [<page_size> <page_num>]
-4) SEND <recipient> <message>
-5) READ [PARTNER <username>] [<page_size> <page_num>]
+1) USERNAME <username>
+2) CREATE <username> <password>
+3) LOGIN <username> <password>
+4) LIST ACCOUNTS [<page_size> <page_num>]
+5) SEND <recipient> <message>
+6) READ [PARTNER <username>] [<page_size> <page_num>]
    - If PARTNER <username> is omitted, returns unread messages (paginated)
    - If PARTNER <username> is provided, returns conversation with that user
-6) DELETE MESSAGE <id1> [<id2> ...]
-7) DELETE ACCOUNT
-8) LOGOUT
-9) QUIT
+7) DELETE MESSAGE <id1> [<id2> ...]
+8) DELETE ACCOUNT
+9) LOGOUT
+10) QUIT
 """)
                 continue
 
             parts = user_input.split()
             cmd = parts[0].upper()
 
-            if cmd == "CREATE":
+            if cmd == "USERNAME":
+                if len(parts) < 3:
+                    print("[CLIENT] Usage: USERNAME <username>")
+                    continue
+                username = parts[1]
+                password = " ".join(parts[2:])
+                password_hash = hash_password(password)
+                payload = {
+                    "action": "USERNAME",
+                    "username": username
+                }
+                resp = send_request(s, payload)
+                print_response(resp)
+
+            elif cmd == "CREATE":
                 if len(parts) < 3:
                     print("[CLIENT] Usage: CREATE <username> <password>")
                     continue
